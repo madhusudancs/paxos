@@ -16,6 +16,9 @@
  
 package message;
 
-message Accept {
-  required int32 id = 1;
+import "prepare.proto";
+
+message Promise {
+  required bool ack = 1 [default = false];
+  optional Prepare last_accepted = 2;
 }
