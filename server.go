@@ -57,11 +57,19 @@ type Config struct {
 	Replicas  map[string]ReplicaConfig
 }
 
-type Data struct {
-	leader string
+type Accepted struct {
+	ProposerId string
+	Id         int32
 }
 
-var data Data
+type Data struct {
+	Leader string
+}
+
+var (
+	data         Data
+	lastAccepted Accepted
+)
 
 func main() {
 	flags := flagDef()
@@ -158,21 +166,23 @@ func startServer(netAddr NetAddr) {
 func bootstrap(flags Flags, config Config) {
 	numReplicas := len(config.Replicas)
 	quorum := (numReplicas / 2) + 1
-	prepare_id := int32(-1)
+	prepare_id := int32(0)
 	thisId := flags.id
 	connections := make(map[string]net.Conn)
 
-	acceptChan := make(chan message.Accept, numReplicas)
+	promiseChan := make(chan message.Promise)
+
+	var promiseMessage message.Promise
 
 	log.Println("Bootstrapping ...")
 
 	tick := time.Tick(config.Heartbeat.Interval * time.Millisecond)
 	for _ = range tick {
-		if data.leader != "" {
+		if data.Leader != "" {
 			break
 		}
 		for id, replica := range config.Replicas {
-			if _, ok := connections[id]; ok || id == thisId {
+			if _, ok := connections[id]; ok {
 				continue
 			}
 
@@ -188,32 +198,113 @@ func bootstrap(flags Flags, config Config) {
 		}
 
 		prepare_id++
-		prepareMessage := &message.Prepare{
-			ProposerId: proto.String(thisId),
-			Id:         proto.Int32(prepare_id),
+		prepareMessage := &message.Message{
+			Type: message.Message_PREPARE.Enum(),
+			Prepare: &message.Prepare{
+				ProposerId: proto.String(thisId),
+				Id:         proto.Int32(prepare_id),
+			},
 		}
 		serializedPrepareMessage, err := proto.Marshal(prepareMessage)
 		if err != nil {
-			log.Fatal("Marshaling error: ", err)
-		}
-		for _, conn := range connections {
-			go prepare(acceptChan, conn, serializedPrepareMessage)
-		}
-		for i := 0; i < quorum; i++ {
-			<-acceptChan
+			log.Println("Marshaling error: ", err)
+			continue
 		}
 
+		if len(connections) < quorum {
+			continue
+		}
+
+		for _, conn := range connections {
+			go prepare(promiseChan, conn, serializedPrepareMessage, config)
+		}
+
+		promiseCount := 0
+		for i := 0; i < numReplicas; i++ {
+			promiseMessage = <-promiseChan
+			if *promiseMessage.Ack {
+				promiseCount++
+				log.Println("Promise count: ", promiseCount)
+				if promiseCount >= quorum {
+					data.Leader = thisId
+					log.Println("Leader elected: ", data.Leader)
+					break
+				}
+			}
+		}
 	}
 }
 
-func prepare(acceptChan chan message.Accept, conn net.Conn, serializedPrepareMessage []byte) {
-	conn.Write(serializedPrepareMessage)
+func prepare(promiseChan chan message.Promise, conn net.Conn, serializedPrepareMessage []byte, config Config) {
+	timeOut := config.Heartbeat.Interval * time.Duration(config.Heartbeat.Max)
+	conn.SetWriteDeadline(time.Now().Add(timeOut))
+	_, err := conn.Write(serializedPrepareMessage)
+	if err != nil {
+		log.Println("Prepare send failed")
+		promiseChan <- message.Promise{
+			Ack: proto.Bool(false),
+		}
+		return
+	}
+
+	readBuf := make([]byte, BufSize)
+	conn.SetReadDeadline(time.Now().Add(timeOut))
+	_, err = conn.Read(readBuf)
+	if err != nil {
+		log.Println("Promise receive failed")
+		promiseChan <- message.Promise{
+			Ack: proto.Bool(false),
+		}
+		return
+	}
+	promiseMessage := &message.Message{}
+	proto.Unmarshal(readBuf, promiseMessage)
+	promiseChan <- *promiseMessage.Promise
 }
 
 func handleCoordinationMessage(conn net.Conn) {
 	readBuf := make([]byte, BufSize)
 	conn.Read(readBuf)
-	fmt.Printf("read: %+v\n", string(readBuf))
+
+	prepareMessage := &message.Message{}
+	proto.Unmarshal(readBuf, prepareMessage)
+
+	switch *prepareMessage.Type {
+	case message.Message_PREPARE:
+		go promise(conn, *prepareMessage.Prepare)
+	}
+
+}
+
+func promise(conn net.Conn, prepareMessage message.Prepare) {
+	var promiseMessage *message.Message
+	if *prepareMessage.Id > lastAccepted.Id {
+		promiseMessage = &message.Message{
+			Type: message.Message_PROMISE.Enum(),
+			Promise: &message.Promise{
+				Ack: proto.Bool(true),
+			},
+		}
+		lastAccepted.ProposerId = *prepareMessage.ProposerId
+		lastAccepted.Id = *prepareMessage.Id
+	} else {
+		promiseMessage = &message.Message{
+			Type: message.Message_PROMISE.Enum(),
+			Promise: &message.Promise{
+				Ack: proto.Bool(false),
+				LastAccepted: &message.Prepare{
+					ProposerId: proto.String(lastAccepted.ProposerId),
+					Id:         proto.Int32(lastAccepted.Id),
+				},
+			},
+		}
+	}
+	serializedPromiseMessage, err := proto.Marshal(promiseMessage)
+	if err != nil {
+		log.Println("Marshaling error: ", err)
+		return
+	}
+	conn.Write(serializedPromiseMessage)
 }
 
 func handleClientMessage(conn net.Conn) {
