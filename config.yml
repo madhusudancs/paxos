@@ -1,0 +1,39 @@
+heartbeat:
+    interval: 10000
+    max: 5
+replicas:
+    r0:
+        cluster:
+            host: localhost
+            port: 9000
+        client:
+            host: localhost
+            port: 8000
+    r1:
+        cluster:
+            host: localhost
+            port: 9001
+        client:
+            host: localhost
+            port: 8001
+    r2:
+        cluster:
+            host: localhost
+            port: 9002
+        client:
+            host: localhost
+            port: 8002
+    r3:
+        cluster:
+            host: localhost
+            port: 9003
+        client:
+            host: localhost
+            port: 8003
+    r4:
+        cluster:
+            host: localhost
+            port: 9004
+        client:
+            host: localhost
+            port: 8004
