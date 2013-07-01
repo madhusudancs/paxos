@@ -157,12 +157,12 @@ func startServer(netAddr NetAddr) {
 
 func bootstrap(flags Flags, config Config) {
 	numReplicas := len(config.Replicas)
-	quorom := (numReplicas / 2) + 1
+	quorum := (numReplicas / 2) + 1
 	prepare_id := int32(-1)
 	thisId := flags.id
 	connections := make(map[string]net.Conn)
 
-	accept := make(chan Accept, numReplicas)
+	acceptChan := make(chan message.Accept, numReplicas)
 
 	log.Println("Bootstrapping ...")
 
@@ -197,13 +197,16 @@ func bootstrap(flags Flags, config Config) {
 			log.Fatal("Marshaling error: ", err)
 		}
 		for _, conn := range connections {
-			go prepare(conn, serializedPrepareMessage)
+			go prepare(acceptChan, conn, serializedPrepareMessage)
+		}
+		for i := 0; i < quorum; i++ {
+			<-acceptChan
 		}
 
 	}
 }
 
-func prepare(conn net.Conn, serializedPrepareMessage []byte) {
+func prepare(acceptChan chan message.Accept, conn net.Conn, serializedPrepareMessage []byte) {
 	conn.Write(serializedPrepareMessage)
 }
 
