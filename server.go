@@ -4,9 +4,9 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * you may obtain a copy of the License from
- * 
+ *
  *     http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -17,18 +17,29 @@
 package main
 
 import (
+	"flag"
 	"fmt"
-    "flag"
 	"io/ioutil"
+	"log"
 	"net"
+	"time"
 
+	"code.google.com/p/goprotobuf/proto"
 	"launchpad.net/goyaml"
+
+	"./message"
 )
 
-var BUF_SIZE = 4096
+const BufSize = 4096
 
 type Flags struct {
-    id string
+	id      string
+	dataDir string
+}
+
+type HeartbeatConfig struct {
+	Interval time.Duration
+	Max      int
 }
 
 type NetAddr struct {
@@ -37,38 +48,51 @@ type NetAddr struct {
 }
 
 type ReplicaConfig struct {
-	ClusterNetAddr NetAddr
-	ClientNetAddr NetAddr
+	Cluster NetAddr
+	Client  NetAddr
 }
 
 type Config struct {
-	Replicas map[string] ReplicaConfig
+	Heartbeat HeartbeatConfig
+	Replicas  map[string]ReplicaConfig
 }
 
+type Data struct {
+	leader string
+}
+
+var data Data
+
 func main() {
-    flags := flagDef()
+	flags := flagDef()
 	config := getConfig("config.yml")
-    thisId := flags.id
-    thisClusterNetAddr := config.Replicas[thisId].ClusterNetAddr
-    thisClientNetAddr := config.Replicas[thisId].ClientNetAddr
+	thisId := flags.id
+
+	if _, ok := config.Replicas[thisId]; !ok {
+		panic(fmt.Sprintf("No configuration defined for ID: \"%s\"\n", thisId))
+	}
+
+	thisClusterNetAddr := config.Replicas[thisId].Cluster
+	thisClientNetAddr := config.Replicas[thisId].Client
 
 	chErrors := make(chan error, 1)
 	go startCoordinator(thisClusterNetAddr)
 	go startServer(thisClientNetAddr)
-    go bootstrap(thisId, config)
+	go bootstrap(flags, config)
 	<-chErrors
 }
 
-func flagDef() (Flags) {
-    // Define the flags that this program can accept.
-    var id = flag.String("id", "", "ID of this replica")
+func flagDef() Flags {
+	// Define the flags that this program can accept.
+	var id = flag.String("id", "", "ID of this replica")
+	var dataDir = flag.String("data", "", "Path to the data directory")
 
-    // Parse the flags
-    flag.Parse()
+	// Parse the flags
+	flag.Parse()
 
-    flags := Flags{*id}
+	flags := Flags{*id, *dataDir}
 
-    return flags
+	return flags
 }
 
 func readConfigFile(fileName string) []byte {
@@ -90,11 +114,11 @@ func getConfig(fileName string) Config {
 }
 
 func tcpListen(netAddr NetAddr) (net.Listener, error) {
-    return net.Listen("tcp", fmt.Sprintf("%s:%d", netAddr.Host, netAddr.Port))
+	return net.Listen("tcp", fmt.Sprintf("%s:%d", netAddr.Host, netAddr.Port))
 }
 
 func tcpDial(netAddr NetAddr) (net.Conn, error) {
-    return net.Dial("tcp", fmt.Sprintf("%s:%d", netAddr.Host, netAddr.Port))
+	return net.Dial("tcp", fmt.Sprintf("%s:%d", netAddr.Host, netAddr.Port))
 }
 
 func startCoordinator(netAddr NetAddr) {
@@ -102,6 +126,8 @@ func startCoordinator(netAddr NetAddr) {
 	if err != nil {
 		panic(err)
 	}
+	log.Printf("Coordinator server started on %+v\n", netAddr)
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -117,6 +143,8 @@ func startServer(netAddr NetAddr) {
 	if err != nil {
 		panic(err)
 	}
+	log.Printf("Client server started on %+v\n", netAddr)
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -127,25 +155,66 @@ func startServer(netAddr NetAddr) {
 	}
 }
 
-func bootstrap(thisId string, config Config) {
-    for id, replica := config.Replicas {
-        conn, err := tcpDial(replica.ClusterNetAddr)
-    }
-    prepare(thisId)
+func bootstrap(flags Flags, config Config) {
+	numReplicas := len(config.Replicas)
+	quorom := (numReplicas / 2) + 1
+	prepare_id := int32(-1)
+	thisId := flags.id
+	connections := make(map[string]net.Conn)
+
+	accept := make(chan Accept, numReplicas)
+
+	log.Println("Bootstrapping ...")
+
+	tick := time.Tick(config.Heartbeat.Interval * time.Millisecond)
+	for _ = range tick {
+		if data.leader != "" {
+			break
+		}
+		for id, replica := range config.Replicas {
+			if _, ok := connections[id]; ok || id == thisId {
+				continue
+			}
+
+			conn, err := tcpDial(replica.Cluster)
+
+			if err != nil {
+				log.Printf("Dialing to %s failed %+v\n", id, err)
+				// handle error
+				continue
+			}
+			log.Printf("Connected to %s ...\n", id)
+			connections[id] = conn
+		}
+
+		prepare_id++
+		prepareMessage := &message.Prepare{
+			ProposerId: proto.String(thisId),
+			Id:         proto.Int32(prepare_id),
+		}
+		serializedPrepareMessage, err := proto.Marshal(prepareMessage)
+		if err != nil {
+			log.Fatal("Marshaling error: ", err)
+		}
+		for _, conn := range connections {
+			go prepare(conn, serializedPrepareMessage)
+		}
+
+	}
 }
 
-func prepare(thisId string) {
-
+func prepare(conn net.Conn, serializedPrepareMessage []byte) {
+	conn.Write(serializedPrepareMessage)
 }
 
 func handleCoordinationMessage(conn net.Conn) {
-	readBuf := make([]byte, BUF_SIZE)
+	readBuf := make([]byte, BufSize)
 	conn.Read(readBuf)
 	fmt.Printf("read: %+v\n", string(readBuf))
 }
 
 func handleClientMessage(conn net.Conn) {
-	readBuf := make([]byte, BUF_SIZE)
+	readBuf := make([]byte, BufSize)
 	conn.Read(readBuf)
 	fmt.Printf("read: %+v\n", string(readBuf))
 }
