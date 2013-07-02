@@ -404,7 +404,6 @@ func prepare(id string, promiseChan chan message.Promise, conn net.Conn, seriali
 	}
 	promiseMessage := &message.Message{}
 	proto.Unmarshal(readBuf, promiseMessage)
-	log.Printf("Promise message received: %s %+v\n", id, promiseMessage)
 	promiseChan <- *promiseMessage.Promise
 }
 
@@ -433,7 +432,6 @@ func request(id string, acceptChan chan message.Accept, conn net.Conn, serialize
 	}
 	acceptMessage := &message.Message{}
 	proto.Unmarshal(readBuf, acceptMessage)
-	log.Printf("Accept message received: %s %+v\n", id, acceptMessage)
 	acceptChan <- *acceptMessage.Accept
 }
 
@@ -464,7 +462,6 @@ func handleCoordinationMessage(conn net.UDPConn) {
 }
 
 func promise(conn net.UDPConn, clientAddr *net.UDPAddr, prepareMessage message.Prepare) {
-	log.Printf("Prepare message received: %+v\n", prepareMessage)
 	var promiseMessage *message.Message
 	if data.AmITheLeader {
 		promiseMessage = &message.Message{
@@ -510,7 +507,6 @@ func promise(conn net.UDPConn, clientAddr *net.UDPAddr, prepareMessage message.P
 }
 
 func accept(conn net.UDPConn, clientAddr *net.UDPAddr, requestMessage message.Request) {
-	log.Printf("Request message received: %+v\n", requestMessage)
 	var acceptMessage *message.Message
 	ack := false
 	if data.AmITheLeader {
@@ -524,7 +520,6 @@ func accept(conn net.UDPConn, clientAddr *net.UDPAddr, requestMessage message.Re
 		data.Leader = lastAccepted.ProposerId
 		data.AmITheLeader = false
 		lastAccepted.Value = *requestMessage.Value
-		log.Printf("Accepting leadership of %+v\n", data.Leader)
 	} else {
 		ack = false
 	}
