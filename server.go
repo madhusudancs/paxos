@@ -119,8 +119,8 @@ func testLiveness(config Config) bool {
 	if data.AmITheLeader {
 		return true
 	}
-	heartBeatMessage := &message.Message{
-		Type: message.Message_HEARTBEAT.Enum(),
+	heartBeatMessage := &message.CoordinationMessage{
+		Type: message.CoordinationMessage_HEARTBEAT.Enum(),
 	}
 	serializedHeartBeatMessage, err := proto.Marshal(heartBeatMessage)
 	if err != nil {
@@ -128,7 +128,7 @@ func testLiveness(config Config) bool {
 		return false
 	}
 
-	conn, err := udpDial(config.Replicas[data.Leader].Cluster)
+	conn, err := udpDial(config.Replicas[data.Leader].Coordinator.Message)
 
 	if err != nil {
 		log.Printf("Dialing to %s failed %+v\n", data.Leader, err)
@@ -151,10 +151,10 @@ func testLiveness(config Config) bool {
 		log.Println("Heartbeat ACK receive failed")
 		return false
 	}
-	heartBeatAckMessage := &message.Message{}
+	heartBeatAckMessage := &message.CoordinationMessage{}
 	proto.Unmarshal(readBuf, heartBeatAckMessage)
 
-	if *heartBeatAckMessage.Type == message.Message_HEARTBEAT_ACK {
+	if *heartBeatAckMessage.Type == message.CoordinationMessage_HEARTBEAT_ACK {
 		return true
 	}
 	return false
@@ -214,7 +214,7 @@ func startMessageCoordinator(netAddr NetAddr) {
 	}
 	log.Printf("Coordinator server started on %+v\n", netAddr)
 
-	go handleCoordinationMessage(*conn)
+	go handleCoordinatorMessage(*conn)
 }
 
 func startDataCoordinator(netAddr NetAddr) {
@@ -230,7 +230,7 @@ func startDataCoordinator(netAddr NetAddr) {
 			// handle error
 			continue
 		}
-		go handleDataCoordinator(conn)
+		go handleCoordinatorData(conn)
 	}
 }
 
@@ -276,8 +276,8 @@ func paxos(flags Flags, config Config) {
 
 	for data.Leader == "" {
 		prepare_id++
-		prepareMessage := &message.Message{
-			Type: message.Message_PREPARE.Enum(),
+		prepareMessage := &message.CoordinationMessage{
+			Type: message.CoordinationMessage_PREPARE.Enum(),
 			Prepare: &message.Prepare{
 				ProposerId: proto.String(thisId),
 				Id:         proto.Int32(prepare_id),
@@ -291,7 +291,7 @@ func paxos(flags Flags, config Config) {
 
 		promiseChan := make(chan message.Promise, quorum)
 		for id, replica := range config.Replicas {
-			conn, err := udpDial(replica.Cluster)
+			conn, err := udpDial(replica.Coordinator.Message)
 
 			if err != nil {
 				log.Printf("Dialing to %s failed %+v\n", id, err)
@@ -354,8 +354,8 @@ func paxos(flags Flags, config Config) {
 			}
 		}
 
-		requestMessage := &message.Message{
-			Type: message.Message_REQUEST.Enum(),
+		requestMessage := &message.CoordinationMessage{
+			Type: message.CoordinationMessage_REQUEST.Enum(),
 			Request: &message.Request{
 				Prepare: &message.Prepare{
 					ProposerId: proto.String(thisId),
@@ -372,7 +372,7 @@ func paxos(flags Flags, config Config) {
 		acceptChan := make(chan message.Accept, quorum)
 
 		for id, replica := range config.Replicas {
-			conn, err := udpDial(replica.Cluster)
+			conn, err := udpDial(replica.Coordinator.Message)
 
 			if err != nil {
 				log.Printf("Dialing to %s failed %+v\n", id, err)
@@ -433,7 +433,7 @@ func prepare(id string, promiseChan chan message.Promise, conn net.Conn, seriali
 		}
 		return
 	}
-	promiseMessage := &message.Message{}
+	promiseMessage := &message.CoordinationMessage{}
 	proto.Unmarshal(readBuf, promiseMessage)
 	promiseChan <- *promiseMessage.Promise
 }
@@ -461,12 +461,12 @@ func request(id string, acceptChan chan message.Accept, conn net.Conn, serialize
 		}
 		return
 	}
-	acceptMessage := &message.Message{}
+	acceptMessage := &message.CoordinationMessage{}
 	proto.Unmarshal(readBuf, acceptMessage)
 	acceptChan <- *acceptMessage.Accept
 }
 
-func handleCoordinationMessage(conn net.UDPConn) {
+func handleCoordinatorMessage(conn net.UDPConn) {
 	for {
 		readBuf := make([]byte, BufSize)
 		_, clientAddr, err := conn.ReadFromUDP(readBuf)
@@ -478,33 +478,33 @@ func handleCoordinationMessage(conn net.UDPConn) {
 			continue
 		}
 
-		coordinationMessage := &message.Message{}
+		coordinationMessage := &message.CoordinationMessage{}
 		proto.Unmarshal(readBuf, coordinationMessage)
 
 		switch *coordinationMessage.Type {
-		case message.Message_PREPARE:
+		case message.CoordinationMessage_PREPARE:
 			go promise(conn, clientAddr, *coordinationMessage.Prepare)
-		case message.Message_REQUEST:
+		case message.CoordinationMessage_REQUEST:
 			go accept(conn, clientAddr, *coordinationMessage.Request)
-		case message.Message_HEARTBEAT:
+		case message.CoordinationMessage_HEARTBEAT:
 			go heartbeatAck(conn, clientAddr)
 		}
 	}
 }
 
 func promise(conn net.UDPConn, clientAddr *net.UDPAddr, prepareMessage message.Prepare) {
-	var promiseMessage *message.Message
+	var promiseMessage *message.CoordinationMessage
 	if data.AmITheLeader {
-		promiseMessage = &message.Message{
-			Type: message.Message_PROMISE.Enum(),
+		promiseMessage = &message.CoordinationMessage{
+			Type: message.CoordinationMessage_PROMISE.Enum(),
 			Promise: &message.Promise{
 				Ack:    proto.Bool(false),
 				Leader: proto.String(data.Leader),
 			},
 		}
 	} else if *prepareMessage.Id > lastAccepted.Id {
-		promiseMessage = &message.Message{
-			Type: message.Message_PROMISE.Enum(),
+		promiseMessage = &message.CoordinationMessage{
+			Type: message.CoordinationMessage_PROMISE.Enum(),
 			Promise: &message.Promise{
 				Ack:               proto.Bool(true),
 				LastAcceptedValue: proto.Int32(lastAccepted.Value),
@@ -517,8 +517,8 @@ func promise(conn net.UDPConn, clientAddr *net.UDPAddr, prepareMessage message.P
 		lastAccepted.ProposerId = *prepareMessage.ProposerId
 		lastAccepted.Id = *prepareMessage.Id
 	} else {
-		promiseMessage = &message.Message{
-			Type: message.Message_PROMISE.Enum(),
+		promiseMessage = &message.CoordinationMessage{
+			Type: message.CoordinationMessage_PROMISE.Enum(),
 			Promise: &message.Promise{
 				Ack:               proto.Bool(false),
 				LastAcceptedValue: proto.Int32(lastAccepted.Value),
@@ -538,7 +538,7 @@ func promise(conn net.UDPConn, clientAddr *net.UDPAddr, prepareMessage message.P
 }
 
 func accept(conn net.UDPConn, clientAddr *net.UDPAddr, requestMessage message.Request) {
-	var acceptMessage *message.Message
+	var acceptMessage *message.CoordinationMessage
 	ack := false
 	if data.AmITheLeader {
 		if thisId == *requestMessage.Prepare.ProposerId {
@@ -554,8 +554,8 @@ func accept(conn net.UDPConn, clientAddr *net.UDPAddr, requestMessage message.Re
 	} else {
 		ack = false
 	}
-	acceptMessage = &message.Message{
-		Type: message.Message_ACCEPT.Enum(),
+	acceptMessage = &message.CoordinationMessage{
+		Type: message.CoordinationMessage_ACCEPT.Enum(),
 		Accept: &message.Accept{
 			Ack: proto.Bool(ack),
 		},
@@ -572,8 +572,8 @@ func heartbeatAck(conn net.UDPConn, clientAddr *net.UDPAddr) {
 	if !data.AmITheLeader {
 		return
 	}
-	heartbeatAckMessage := &message.Message{
-		Type: message.Message_HEARTBEAT_ACK.Enum(),
+	heartbeatAckMessage := &message.CoordinationMessage{
+		Type: message.CoordinationMessage_HEARTBEAT_ACK.Enum(),
 	}
 
 	serializedHeartbeatAckMessage, err := proto.Marshal(heartbeatAckMessage)
@@ -584,34 +584,12 @@ func heartbeatAck(conn net.UDPConn, clientAddr *net.UDPAddr) {
 	conn.WriteToUDP(serializedHeartbeatAckMessage, clientAddr)
 }
 
-func handleClientMessage(conn net.Conn) {
-	for {
-		readBuf := make([]byte, BufSize)
-		_, clientAddr, err := conn.ReadFromUDP(readBuf)
-		if err != nil {
-			if err == io.EOF {
-				return
-			}
-			log.Printf("Coordination message reading error", err)
-			continue
-		}
+func handleClientMessage(conn net.UDPConn) {
 
-		clientMessage := &message.Message{}
-		proto.Unmarshal(readBuf, clientMessage)
-
-		switch *clientMessage.Type {
-		case message.Message_PREPARE:
-			go promise(conn, clientAddr, *coordinationMessage.Prepare)
-		case message.Message_REQUEST:
-			go accept(conn, clientAddr, *coordinationMessage.Request)
-		case message.Message_HEARTBEAT:
-			go heartbeatAck(conn, clientAddr)
-		}
-	}
 }
 
-func handleDataClient(conn net.Conn) {
+func handleClientData(conn net.Conn) {
 }
 
-func handleDataCoordinator(conn net.Conn) {
+func handleCoordinatorData(conn net.Conn) {
 }
