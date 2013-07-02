@@ -16,22 +16,6 @@
  
 package message;
 
-import "prepare.proto";
-import "promise.proto";
-import "request.proto";
-import "accept.proto";
-
-message Message {
-  enum MessageType {
-    PREPARE = 0;
-    PROMISE = 1;
-    REQUEST = 2;
-    ACCEPT = 3;
-  }
-
-  required MessageType type = 1;
-  optional Prepare prepare  = 2;
-  optional Promise promise  = 3;
-  optional Request request  = 4;
-  optional Accept accept  = 5;
+message Accept {
+  required bool ack = 1 [default = false];
 }

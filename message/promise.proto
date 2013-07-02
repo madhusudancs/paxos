@@ -20,5 +20,8 @@ import "prepare.proto";
 
 message Promise {
   required bool ack = 1 [default = false];
-  optional Prepare last_accepted = 2;
+  optional int32 last_accepted_value = 2;
+  optional Prepare last_accepted = 3;
+  optional string leader = 4;	
 }
+	
