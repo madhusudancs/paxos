@@ -1,5 +1,5 @@
 heartbeat:
-    interval: 10000
+    interval: 1000
     max: 5
 replicas:
     r0:
