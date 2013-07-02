@@ -6,4 +6,4 @@ This is my attempt at implementing paxos.
 Status
 ======
 
-Phase 1, the leader election of the paxos protocol is implemented.
+This is a fully functional paxos implementation in Go. Documentation will be updated.
