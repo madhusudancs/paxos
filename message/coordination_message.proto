@@ -21,7 +21,7 @@ import "promise.proto";
 import "request.proto";
 import "accept.proto";
 
-message Message {
+message CoordinationMessage {
   enum MessageType {
     PREPARE = 0;
     PROMISE = 1;
