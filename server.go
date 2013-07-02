@@ -48,9 +48,14 @@ type NetAddr struct {
 	Port int
 }
 
+type Listeners struct {
+	Message NetAddr
+	Data    NetAddr
+}
+
 type ReplicaConfig struct {
-	Cluster NetAddr
-	Client  NetAddr
+	Coordinator Listeners
+	Server      Listeners
 }
 
 type Config struct {
@@ -86,12 +91,11 @@ func main() {
 		panic(fmt.Sprintf("No configuration defined for ID: \"%s\"\n", thisId))
 	}
 
-	thisClusterNetAddr := config.Replicas[thisId].Cluster
-	thisClientNetAddr := config.Replicas[thisId].Client
-
 	prepare_id = 0
-	go startCoordinator(thisClusterNetAddr)
-	go startServer(thisClientNetAddr)
+	go startMessageCoordinator(config.Replicas[thisId].Coordinator.Message)
+	go startDataCoordinator(config.Replicas[thisId].Coordinator.Data)
+	go startMessageCoordinator(config.Replicas[thisId].Server.Message)
+	go startDataServer(config.Replicas[thisId].Server.Data)
 	go paxos(flags, config)
 
 	tick := time.Tick(config.Heartbeat.Interval * time.Millisecond)
@@ -203,7 +207,7 @@ func tcpListen(netAddr NetAddr) (net.Listener, error) {
 	return net.Listen("tcp", fmt.Sprintf("%s:%d", netAddr.Host, netAddr.Port))
 }
 
-func startCoordinator(netAddr NetAddr) {
+func startMessageCoordinator(netAddr NetAddr) {
 	conn, err := udpListen(netAddr)
 	if err != nil {
 		panic(err)
@@ -213,7 +217,7 @@ func startCoordinator(netAddr NetAddr) {
 	go handleCoordinationMessage(*conn)
 }
 
-func startServer(netAddr NetAddr) {
+func startDataCoordinator(netAddr NetAddr) {
 	ln, err := tcpListen(netAddr)
 	if err != nil {
 		panic(err)
@@ -226,7 +230,34 @@ func startServer(netAddr NetAddr) {
 			// handle error
 			continue
 		}
-		go handleClientMessage(conn)
+		go handleDataCoordinator(conn)
+	}
+}
+
+func startMessageServer(netAddr NetAddr) {
+	conn, err := udpListen(netAddr)
+	if err != nil {
+		panic(err)
+	}
+	log.Printf("Coordinator server started on %+v\n", netAddr)
+
+	go handleClientMessage(*conn)
+}
+
+func startDataServer(netAddr NetAddr) {
+	ln, err := tcpListen(netAddr)
+	if err != nil {
+		panic(err)
+	}
+	log.Printf("Client server started on %+v\n", netAddr)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			// handle error
+			continue
+		}
+		go handleClientData(conn)
 	}
 }
 
@@ -554,7 +585,33 @@ func heartbeatAck(conn net.UDPConn, clientAddr *net.UDPAddr) {
 }
 
 func handleClientMessage(conn net.Conn) {
-	readBuf := make([]byte, BufSize)
-	conn.Read(readBuf)
-	fmt.Printf("read: %+v\n", string(readBuf))
+	for {
+		readBuf := make([]byte, BufSize)
+		_, clientAddr, err := conn.ReadFromUDP(readBuf)
+		if err != nil {
+			if err == io.EOF {
+				return
+			}
+			log.Printf("Coordination message reading error", err)
+			continue
+		}
+
+		clientMessage := &message.Message{}
+		proto.Unmarshal(readBuf, clientMessage)
+
+		switch *clientMessage.Type {
+		case message.Message_PREPARE:
+			go promise(conn, clientAddr, *coordinationMessage.Prepare)
+		case message.Message_REQUEST:
+			go accept(conn, clientAddr, *coordinationMessage.Request)
+		case message.Message_HEARTBEAT:
+			go heartbeatAck(conn, clientAddr)
+		}
+	}
+}
+
+func handleDataClient(conn net.Conn) {
+}
+
+func handleDataCoordinator(conn net.Conn) {
 }
