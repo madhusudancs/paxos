@@ -19,6 +19,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -60,10 +61,12 @@ type Config struct {
 type Accepted struct {
 	ProposerId string
 	Id         int32
+	Value      int32
 }
 
 type Data struct {
-	Leader string
+	AmITheLeader bool
+	Leader       string
 }
 
 var (
@@ -83,11 +86,13 @@ func main() {
 	thisClusterNetAddr := config.Replicas[thisId].Cluster
 	thisClientNetAddr := config.Replicas[thisId].Client
 
-	chErrors := make(chan error, 1)
 	go startCoordinator(thisClusterNetAddr)
 	go startServer(thisClientNetAddr)
-	go bootstrap(flags, config)
-	<-chErrors
+	go paxos(flags, config)
+	tick := time.Tick(config.Heartbeat.Interval * time.Millisecond)
+	for _ = range tick {
+		log.Printf("Leader now is: %s\n", data.Leader)
+	}
 }
 
 func flagDef() Flags {
@@ -139,6 +144,7 @@ func startCoordinator(netAddr NetAddr) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			log.Println("Connection Accepting error")
 			// handle error
 			continue
 		}
@@ -163,16 +169,22 @@ func startServer(netAddr NetAddr) {
 	}
 }
 
-func bootstrap(flags Flags, config Config) {
+func paxos(flags Flags, config Config) {
 	numReplicas := len(config.Replicas)
 	quorum := (numReplicas / 2) + 1
 	prepare_id := int32(0)
 	thisId := flags.id
 	connections := make(map[string]net.Conn)
 
-	promiseChan := make(chan message.Promise)
+	promiseChan := make(chan message.Promise, quorum)
 
 	var promiseMessage message.Promise
+	allPromiseMessages := make([]message.Promise, 0)
+	promiseMessages := make([]message.Promise, 0)
+
+	acceptChan := make(chan message.Accept, quorum)
+
+	var acceptMessage message.Accept
 
 	log.Println("Bootstrapping ...")
 
@@ -219,24 +231,92 @@ func bootstrap(flags Flags, config Config) {
 			go prepare(promiseChan, conn, serializedPrepareMessage, config)
 		}
 
-		promiseCount := 0
+		restart := true
 		for i := 0; i < numReplicas; i++ {
 			promiseMessage = <-promiseChan
+			allPromiseMessages = append(promiseMessages, promiseMessage)
 			if *promiseMessage.Ack {
-				promiseCount++
-				log.Println("Promise count: ", promiseCount)
-				if promiseCount >= quorum {
+				promiseMessages = append(promiseMessages, promiseMessage)
+				if len(promiseMessages) >= quorum {
 					data.Leader = thisId
-					log.Println("Leader elected: ", data.Leader)
+					data.AmITheLeader = true
+					restart = false
+					break
+				}
+			} else if promiseMessage.Leader != nil && *promiseMessage.Leader != "" {
+				restart = true
+				// There is a leader candidate, so wait for a tick to see if the candidate is really chosen
+				break
+			}
+		}
+
+		if restart {
+			continue
+		}
+
+		for tickTimeout := config.Heartbeat.Max; tickTimeout > 0 && len(allPromiseMessages) < numReplicas; {
+			select {
+			case promiseMessage = <-promiseChan:
+				allPromiseMessages = append(promiseMessages, promiseMessage)
+				if *promiseMessage.Ack {
+					promiseMessages = append(promiseMessages, promiseMessage)
+				}
+			case <-tick:
+				tickTimeout--
+			}
+		}
+
+		maxId := int32(-1)
+		maxValue := int32(0)
+		for _, promiseMessage = range promiseMessages {
+			if *promiseMessage.LastAccepted.Id > maxId {
+				maxId = *promiseMessage.LastAccepted.Id
+				maxValue = *promiseMessage.LastAcceptedValue
+			}
+		}
+
+		requestMessage := &message.Message{
+			Type: message.Message_REQUEST.Enum(),
+			Request: &message.Request{
+				Prepare: &message.Prepare{
+					ProposerId: proto.String(thisId),
+					Id:         proto.Int32(prepare_id),
+				},
+				Value: proto.Int32(maxValue),
+			},
+		}
+		serializedRequestMessage, err := proto.Marshal(requestMessage)
+		if err != nil {
+			log.Println("Marshaling error: ", err)
+		}
+
+		for _, conn := range connections {
+			go request(acceptChan, conn, serializedRequestMessage, config)
+		}
+
+		restart = true
+		acceptCount := 0
+		for _, _ = range promiseMessages {
+			acceptMessage = <-acceptChan
+			if *acceptMessage.Ack {
+				acceptCount++
+				if acceptCount >= quorum {
+					restart = false
 					break
 				}
 			}
 		}
+
+		if !restart {
+			break
+		}
 	}
+	log.Printf("Finally leader elected! And is: %+v\n", data.Leader)
 }
 
 func prepare(promiseChan chan message.Promise, conn net.Conn, serializedPrepareMessage []byte, config Config) {
-	timeOut := config.Heartbeat.Interval * time.Duration(config.Heartbeat.Max)
+	timeOut := (config.Heartbeat.Interval * time.Millisecond) * time.Duration(config.Heartbeat.Max)
+
 	conn.SetWriteDeadline(time.Now().Add(timeOut))
 	_, err := conn.Write(serializedPrepareMessage)
 	if err != nil {
@@ -262,27 +342,78 @@ func prepare(promiseChan chan message.Promise, conn net.Conn, serializedPrepareM
 	promiseChan <- *promiseMessage.Promise
 }
 
-func handleCoordinationMessage(conn net.Conn) {
-	readBuf := make([]byte, BufSize)
-	conn.Read(readBuf)
+func request(acceptChan chan message.Accept, conn net.Conn, serializedRequestMessage []byte, config Config) {
+	timeOut := (config.Heartbeat.Interval * time.Millisecond) * time.Duration(config.Heartbeat.Max)
 
-	prepareMessage := &message.Message{}
-	proto.Unmarshal(readBuf, prepareMessage)
-
-	switch *prepareMessage.Type {
-	case message.Message_PREPARE:
-		go promise(conn, *prepareMessage.Prepare)
+	conn.SetWriteDeadline(time.Now().Add(timeOut))
+	_, err := conn.Write(serializedRequestMessage)
+	if err != nil {
+		log.Println("Request send failed")
+		acceptChan <- message.Accept{
+			Ack: proto.Bool(false),
+		}
+		return
 	}
 
+	readBuf := make([]byte, BufSize)
+	conn.SetReadDeadline(time.Now().Add(timeOut))
+	_, err = conn.Read(readBuf)
+	if err != nil {
+		log.Println("Accept receive failed", err)
+		acceptChan <- message.Accept{
+			Ack: proto.Bool(false),
+		}
+		return
+	}
+	acceptMessage := &message.Message{}
+	proto.Unmarshal(readBuf, acceptMessage)
+	acceptChan <- *acceptMessage.Accept
+}
+
+func handleCoordinationMessage(conn net.Conn) {
+	for {
+		readBuf := make([]byte, BufSize)
+		_, err := conn.Read(readBuf)
+		if err != nil {
+			if err == io.EOF {
+				return
+			}
+			log.Printf("Coordination message reading error", err)
+			continue
+		}
+
+		coordinationMessage := &message.Message{}
+		proto.Unmarshal(readBuf, coordinationMessage)
+
+		switch *coordinationMessage.Type {
+		case message.Message_PREPARE:
+			go promise(conn, *coordinationMessage.Prepare)
+		case message.Message_REQUEST:
+			go accept(conn, *coordinationMessage.Request)
+		}
+	}
 }
 
 func promise(conn net.Conn, prepareMessage message.Prepare) {
 	var promiseMessage *message.Message
-	if *prepareMessage.Id > lastAccepted.Id {
+	if data.AmITheLeader {
 		promiseMessage = &message.Message{
 			Type: message.Message_PROMISE.Enum(),
 			Promise: &message.Promise{
-				Ack: proto.Bool(true),
+				Ack:    proto.Bool(false),
+				Leader: proto.String(data.Leader),
+			},
+		}
+	} else if *prepareMessage.Id > lastAccepted.Id {
+		promiseMessage = &message.Message{
+			Type: message.Message_PROMISE.Enum(),
+			Promise: &message.Promise{
+				Ack:               proto.Bool(true),
+				LastAcceptedValue: proto.Int32(lastAccepted.Value),
+				LastAccepted: &message.Prepare{
+					ProposerId: proto.String(lastAccepted.ProposerId),
+					Id:         proto.Int32(lastAccepted.Id),
+				},
 			},
 		}
 		lastAccepted.ProposerId = *prepareMessage.ProposerId
@@ -291,7 +422,8 @@ func promise(conn net.Conn, prepareMessage message.Prepare) {
 		promiseMessage = &message.Message{
 			Type: message.Message_PROMISE.Enum(),
 			Promise: &message.Promise{
-				Ack: proto.Bool(false),
+				Ack:               proto.Bool(false),
+				LastAcceptedValue: proto.Int32(lastAccepted.Value),
 				LastAccepted: &message.Prepare{
 					ProposerId: proto.String(lastAccepted.ProposerId),
 					Id:         proto.Int32(lastAccepted.Id),
@@ -305,6 +437,42 @@ func promise(conn net.Conn, prepareMessage message.Prepare) {
 		return
 	}
 	conn.Write(serializedPromiseMessage)
+}
+
+func accept(conn net.Conn, requestMessage message.Request) {
+	var acceptMessage *message.Message
+	if data.AmITheLeader {
+		acceptMessage = &message.Message{
+			Type: message.Message_ACCEPT.Enum(),
+			Accept: &message.Accept{
+				Ack: proto.Bool(false),
+			},
+		}
+	} else if *requestMessage.Prepare.Id == lastAccepted.Id && *requestMessage.Prepare.ProposerId == lastAccepted.ProposerId {
+		acceptMessage = &message.Message{
+			Type: message.Message_ACCEPT.Enum(),
+			Accept: &message.Accept{
+				Ack: proto.Bool(true),
+			},
+		}
+		data.Leader = lastAccepted.ProposerId
+		data.AmITheLeader = false
+		lastAccepted.Value = *requestMessage.Value
+		log.Printf("Accepting leadership of %+v\n", data.Leader)
+	} else {
+		acceptMessage = &message.Message{
+			Type: message.Message_ACCEPT.Enum(),
+			Accept: &message.Accept{
+				Ack: proto.Bool(false),
+			},
+		}
+	}
+	serializedAcceptMessage, err := proto.Marshal(acceptMessage)
+	if err != nil {
+		log.Println("Marshaling error: ", err)
+		return
+	}
+	conn.Write(serializedAcceptMessage)
 }
 
 func handleClientMessage(conn net.Conn) {
