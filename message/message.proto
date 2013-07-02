@@ -27,6 +27,8 @@ message Message {
     PROMISE = 1;
     REQUEST = 2;
     ACCEPT = 3;
+    HEARTBEAT = 4;
+    HEARTBEAT_ACK = 5;
   }
 
   required MessageType type = 1;
