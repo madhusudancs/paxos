@@ -493,42 +493,34 @@ func handleCoordinatorMessage(conn net.UDPConn) {
 }
 
 func promise(conn net.UDPConn, clientAddr *net.UDPAddr, prepareMessage message.Prepare) {
-	var promiseMessage *message.CoordinationMessage
+	var ack bool
+	promiseMessage := &message.CoordinationMessage{
+		Type:    message.CoordinationMessage_PROMISE.Enum(),
+		Promise: &message.Promise{},
+	}
+
 	if data.AmITheLeader {
-		promiseMessage = &message.CoordinationMessage{
-			Type: message.CoordinationMessage_PROMISE.Enum(),
-			Promise: &message.Promise{
-				Ack:    proto.Bool(false),
-				Leader: proto.String(data.Leader),
-			},
-		}
+		ack = false
+		promiseMessage.Promise.Leader = proto.String(data.Leader)
 	} else if *prepareMessage.Id > lastAccepted.Id {
-		promiseMessage = &message.CoordinationMessage{
-			Type: message.CoordinationMessage_PROMISE.Enum(),
-			Promise: &message.Promise{
-				Ack:               proto.Bool(true),
-				LastAcceptedValue: proto.Int32(lastAccepted.Value),
-				LastAccepted: &message.Prepare{
-					ProposerId: proto.String(lastAccepted.ProposerId),
-					Id:         proto.Int32(lastAccepted.Id),
-				},
-			},
+		ack = true
+		promiseMessage.Promise.LastAcceptedValue = proto.Int32(lastAccepted.Value)
+		promiseMessage.Promise.LastAccepted = &message.Prepare{
+			ProposerId: proto.String(lastAccepted.ProposerId),
+			Id:         proto.Int32(lastAccepted.Id),
 		}
+
 		lastAccepted.ProposerId = *prepareMessage.ProposerId
 		lastAccepted.Id = *prepareMessage.Id
 	} else {
-		promiseMessage = &message.CoordinationMessage{
-			Type: message.CoordinationMessage_PROMISE.Enum(),
-			Promise: &message.Promise{
-				Ack:               proto.Bool(false),
-				LastAcceptedValue: proto.Int32(lastAccepted.Value),
-				LastAccepted: &message.Prepare{
-					ProposerId: proto.String(lastAccepted.ProposerId),
-					Id:         proto.Int32(lastAccepted.Id),
-				},
-			},
+		ack = false
+		promiseMessage.Promise.LastAcceptedValue = proto.Int32(lastAccepted.Value)
+		promiseMessage.Promise.LastAccepted = &message.Prepare{
+			ProposerId: proto.String(lastAccepted.ProposerId),
+			Id:         proto.Int32(lastAccepted.Id),
 		}
 	}
+	promiseMessage.Promise.Ack = proto.Bool(ack)
 	serializedPromiseMessage, err := proto.Marshal(promiseMessage)
 	if err != nil {
 		log.Println("Marshaling error: ", err)
