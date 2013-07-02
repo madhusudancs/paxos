@@ -3,37 +3,77 @@ heartbeat:
     max: 5
 replicas:
     r0:
-        cluster:
-            host: localhost
-            port: 9000
-        client:
-            host: localhost
-            port: 8000
+        coordinator:
+            message:
+                host: localhost
+                port: 9000
+            data:
+                host: localhost
+                port: 8000
+        server:
+            message:
+                host: localhost
+                port: 7000
+            data:
+                host: localhost
+                port: 6000
     r1:
-        cluster:
-            host: localhost
-            port: 9001
-        client:
-            host: localhost
-            port: 8001
+        coordinator:
+            message:
+                host: localhost
+                port: 9001
+            data:
+                host: localhost
+                port: 8001
+        server:
+            message:
+                host: localhost
+                port: 7001
+            data:
+                host: localhost
+                port: 6001
     r2:
-        cluster:
-            host: localhost
-            port: 9002
-        client:
-            host: localhost
-            port: 8002
+        coordinator:
+            message:
+                host: localhost
+                port: 9002
+            data:
+                host: localhost
+                port: 8002
+        server:
+            message:
+                host: localhost
+                port: 7002
+            data:
+                host: localhost
+                port: 6002
     r3:
-        cluster:
-            host: localhost
-            port: 9003
-        client:
-            host: localhost
-            port: 8003
+        coordinator:
+            message:
+                host: localhost
+                port: 9003
+            data:
+                host: localhost
+                port: 8003
+        server:
+            message:
+                host: localhost
+                port: 7003
+            data:
+                host: localhost
+                port: 6003
     r4:
-        cluster:
-            host: localhost
-            port: 9004
-        client:
-            host: localhost
-            port: 8004
+        coordinator:
+            message:
+                host: localhost
+                port: 9004
+            data:
+                host: localhost
+                port: 8004
+        server:
+            message:
+                host: localhost
+                port: 7004
+            data:
+                host: localhost
+                port: 6004
