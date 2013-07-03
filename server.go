@@ -17,12 +17,14 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"code.google.com/p/goprotobuf/proto"
@@ -70,22 +72,31 @@ type Accepted struct {
 }
 
 type Data struct {
+	RunningCond  *sync.Cond
 	IsRunning    bool
 	AmITheLeader bool
 	Leader       string
 }
 
 var (
+	flags        Flags
+	config       Config
 	thisId       string
 	prepare_id   int32
 	data         Data
 	lastAccepted Accepted
+	connections  map[string]net.Conn
+	storedData   [][]byte
 )
 
 func main() {
-	flags := flagDef()
-	config := getConfig("config.yml")
+	flags = flagDef()
+	config = getConfig("config.yml")
 	thisId = flags.id
+	storedData = make([][]byte, 0)
+
+	var l sync.Mutex
+	data.RunningCond = sync.NewCond(&l)
 
 	if _, ok := config.Replicas[thisId]; !ok {
 		panic(fmt.Sprintf("No configuration defined for ID: \"%s\"\n", thisId))
@@ -94,15 +105,14 @@ func main() {
 	prepare_id = 0
 	go startMessageCoordinator(config.Replicas[thisId].Coordinator.Message)
 	go startDataCoordinator(config.Replicas[thisId].Coordinator.Data)
-	go startMessageCoordinator(config.Replicas[thisId].Server.Message)
+	go startMessageServer(config.Replicas[thisId].Server.Message)
 	go startDataServer(config.Replicas[thisId].Server.Data)
-	go paxos(flags, config)
+	go paxos(flags)
 
 	tick := time.Tick(config.Heartbeat.Interval * time.Millisecond)
 	heartBeatSkipCount := 0
 	for _ = range tick {
-		log.Printf("Leader now is: %s\n", data.Leader)
-		if testLiveness(config) {
+		if testLiveness() {
 			heartBeatSkipCount = 0
 			continue
 		}
@@ -110,12 +120,12 @@ func main() {
 		if heartBeatSkipCount >= config.Heartbeat.Max {
 			data.Leader = ""
 			data.AmITheLeader = false
-			go paxos(flags, config)
+			go paxos(flags)
 		}
 	}
 }
 
-func testLiveness(config Config) bool {
+func testLiveness() bool {
 	if data.AmITheLeader {
 		return true
 	}
@@ -140,7 +150,6 @@ func testLiveness(config Config) bool {
 	conn.SetWriteDeadline(time.Now().Add(timeOut))
 	_, err = conn.Write(serializedHeartBeatMessage)
 	if err != nil {
-		log.Println("Heartbeat send failed")
 		return false
 	}
 
@@ -148,7 +157,6 @@ func testLiveness(config Config) bool {
 	conn.SetReadDeadline(time.Now().Add(timeOut))
 	_, err = conn.Read(readBuf)
 	if err != nil {
-		log.Println("Heartbeat ACK receive failed")
 		return false
 	}
 	heartBeatAckMessage := &message.CoordinationMessage{}
@@ -168,9 +176,7 @@ func flagDef() Flags {
 	// Parse the flags
 	flag.Parse()
 
-	flags := Flags{*id, *dataDir}
-
-	return flags
+	return Flags{*id, *dataDir}
 }
 
 func readConfigFile(fileName string) []byte {
@@ -186,9 +192,9 @@ func readConfigFile(fileName string) []byte {
 
 func getConfig(fileName string) Config {
 	configBytes := readConfigFile(fileName)
-	var config Config
-	goyaml.Unmarshal(configBytes, &config)
-	return config
+	var configLocal Config
+	goyaml.Unmarshal(configBytes, &configLocal)
+	return configLocal
 }
 
 func udpListen(netAddr NetAddr) (*net.UDPConn, error) {
@@ -207,12 +213,16 @@ func tcpListen(netAddr NetAddr) (net.Listener, error) {
 	return net.Listen("tcp", fmt.Sprintf("%s:%d", netAddr.Host, netAddr.Port))
 }
 
+func tcpDial(netAddr NetAddr) (net.Conn, error) {
+	return net.Dial("tcp", fmt.Sprintf("%s:%d", netAddr.Host, netAddr.Port))
+}
+
 func startMessageCoordinator(netAddr NetAddr) {
 	conn, err := udpListen(netAddr)
 	if err != nil {
 		panic(err)
 	}
-	log.Printf("Coordinator server started on %+v\n", netAddr)
+	log.Printf("Coordinator message server started on %+v\n", netAddr)
 
 	go handleCoordinatorMessage(*conn)
 }
@@ -222,7 +232,7 @@ func startDataCoordinator(netAddr NetAddr) {
 	if err != nil {
 		panic(err)
 	}
-	log.Printf("Client server started on %+v\n", netAddr)
+	log.Printf("Coordinator data server started on %+v\n", netAddr)
 
 	for {
 		conn, err := ln.Accept()
@@ -239,7 +249,7 @@ func startMessageServer(netAddr NetAddr) {
 	if err != nil {
 		panic(err)
 	}
-	log.Printf("Coordinator server started on %+v\n", netAddr)
+	log.Printf("Client message server started on %+v\n", netAddr)
 
 	go handleClientMessage(*conn)
 }
@@ -249,7 +259,7 @@ func startDataServer(netAddr NetAddr) {
 	if err != nil {
 		panic(err)
 	}
-	log.Printf("Client server started on %+v\n", netAddr)
+	log.Printf("Client data server started on %+v\n", netAddr)
 
 	for {
 		conn, err := ln.Accept()
@@ -261,7 +271,7 @@ func startDataServer(netAddr NetAddr) {
 	}
 }
 
-func paxos(flags Flags, config Config) {
+func paxos(flags Flags) {
 	// If an instance of Paxos is running we should not run it again
 	if data.IsRunning {
 		return
@@ -271,8 +281,6 @@ func paxos(flags Flags, config Config) {
 
 	numReplicas := len(config.Replicas)
 	quorum := (numReplicas / 2) + 1
-
-	log.Println("Bootstrapping ...")
 
 	for data.Leader == "" {
 		prepare_id++
@@ -298,10 +306,8 @@ func paxos(flags Flags, config Config) {
 				// handle error
 				continue
 			}
-			go prepare(id, promiseChan, conn, serializedPrepareMessage, config)
+			go prepare(id, promiseChan, conn, serializedPrepareMessage)
 		}
-
-		log.Println("Prepare messages sent")
 
 		allPromiseMessages := make([]message.Promise, 0)
 		promiseMessages := make([]message.Promise, 0)
@@ -330,7 +336,6 @@ func paxos(flags Flags, config Config) {
 		if terminate {
 			break
 		}
-		log.Println("Promise quorum received")
 
 		for loop := true; loop && len(allPromiseMessages) < numReplicas; {
 			tick := time.Tick(config.Heartbeat.Interval * time.Millisecond)
@@ -379,10 +384,8 @@ func paxos(flags Flags, config Config) {
 				// handle error
 				continue
 			}
-			go request(id, acceptChan, conn, serializedRequestMessage, config)
+			go request(id, acceptChan, conn, serializedRequestMessage)
 		}
-
-		log.Println("Request sent")
 
 		restart := true
 		acceptCount := 0
@@ -396,7 +399,6 @@ func paxos(flags Flags, config Config) {
 				}
 			}
 		}
-		log.Println("Accept messages received")
 
 		if restart {
 			data.Leader = ""
@@ -407,10 +409,10 @@ func paxos(flags Flags, config Config) {
 		}
 	}
 	data.IsRunning = false
-	log.Printf("Finally leader elected! And is: %+v\n", data.Leader)
+	data.RunningCond.Broadcast()
 }
 
-func prepare(id string, promiseChan chan message.Promise, conn net.Conn, serializedPrepareMessage []byte, config Config) {
+func prepare(id string, promiseChan chan message.Promise, conn net.Conn, serializedPrepareMessage []byte) {
 	timeOut := (config.Heartbeat.Interval * time.Millisecond) * time.Duration(config.Heartbeat.Max)
 
 	conn.SetWriteDeadline(time.Now().Add(timeOut))
@@ -438,7 +440,7 @@ func prepare(id string, promiseChan chan message.Promise, conn net.Conn, seriali
 	promiseChan <- *promiseMessage.Promise
 }
 
-func request(id string, acceptChan chan message.Accept, conn net.Conn, serializedRequestMessage []byte, config Config) {
+func request(id string, acceptChan chan message.Accept, conn net.Conn, serializedRequestMessage []byte) {
 	timeOut := (config.Heartbeat.Interval * time.Millisecond) * time.Duration(config.Heartbeat.Max)
 
 	conn.SetWriteDeadline(time.Now().Add(timeOut))
@@ -577,11 +579,187 @@ func heartbeatAck(conn net.UDPConn, clientAddr *net.UDPAddr) {
 }
 
 func handleClientMessage(conn net.UDPConn) {
+	for {
+		readBuf := make([]byte, BufSize)
+		_, clientAddr, err := conn.ReadFromUDP(readBuf)
+		if err != nil {
+			if err == io.EOF {
+				return
+			}
+			log.Printf("Coordination message reading error", err)
+			continue
+		}
 
+		getLeaderMessage := &message.GetLeader{}
+		proto.Unmarshal(readBuf, getLeaderMessage)
+
+		replyLeaderMessage := &message.ReplyLeader{}
+
+		if data.Leader != "" {
+			replyLeaderMessage.Leader = proto.String(data.Leader)
+		}
+
+		serializedReplyLeaderMessage, err := proto.Marshal(replyLeaderMessage)
+		if err != nil {
+			log.Println("Marshaling error: ", err)
+			return
+		}
+		conn.WriteToUDP(serializedReplyLeaderMessage, clientAddr)
+	}
 }
 
 func handleClientData(conn net.Conn) {
+	for {
+		readBuf := make([]byte, BufSize)
+		_, err := conn.Read(readBuf)
+		if err != nil {
+			if err == io.EOF {
+				return
+			}
+			log.Printf("Client data reading error", err)
+			continue
+		}
+
+		clientDataMessage := &message.ClientData{}
+		proto.Unmarshal(readBuf, clientDataMessage)
+
+		clientDataAckMessage := &message.ClientDataAck{}
+
+		_, err = quorumWrite(clientDataMessage.Data)
+		if err != nil {
+			clientDataAckMessage.Ack = proto.Bool(false)
+		} else {
+			clientDataAckMessage.Ack = proto.Bool(true)
+		}
+
+		serializedClientDataAckMessage, err := proto.Marshal(clientDataAckMessage)
+		if err != nil {
+			log.Println("Marshaling error: ", err)
+			return
+		}
+		conn.Write(serializedClientDataAckMessage)
+	}
+}
+
+func quorumWrite(clientData []byte) (int, error) {
+	numReplicas := len(config.Replicas)
+	quorum := (numReplicas / 2) + 1
+
+	data.RunningCond.L.Lock()
+	for data.IsRunning {
+		data.RunningCond.Wait()
+	}
+	data.RunningCond.L.Unlock()
+
+	if !data.AmITheLeader {
+		return 0, errors.New("I am not the leader.")
+	}
+
+	coordinatorDataMessage := &message.CoordinatorData{
+		Leader: proto.String(thisId),
+		Data:   clientData,
+	}
+
+	serializedCoordinatorDataMessage, err := proto.Marshal(coordinatorDataMessage)
+	if err != nil {
+		log.Println("Marshaling error: ", err)
+		return 0, err
+	}
+
+	dataAckChan := make(chan message.CoordinatorDataAck, quorum)
+	for id, replica := range config.Replicas {
+		conn, ok := connections[id]
+		if !ok {
+			conn, err = tcpDial(replica.Coordinator.Data)
+			if err != nil {
+				log.Printf("TCP dialing to %s failed %+v\n", id, err)
+				// handle error
+				continue
+			}
+		}
+
+		go replicaWrite(dataAckChan, serializedCoordinatorDataMessage, conn)
+	}
+
+	log.Println("Replica writes sent")
+
+	ackCount := 0
+	for _ = range config.Replicas {
+		coordinatorDataAckMessage := <-dataAckChan
+		log.Printf("Coordinator Data Ack Message: %+v\n", coordinatorDataAckMessage)
+		if *coordinatorDataAckMessage.Ack {
+			ackCount++
+			if ackCount >= quorum {
+				log.Println("Coordinator Data Ack Quorum reached")
+				return len(clientData), nil
+			}
+		}
+	}
+	return 0, errors.New("Quorum write failed")
+}
+
+func replicaWrite(dataAckChan chan message.CoordinatorDataAck, serializedCoordinatorDataMessage []byte, conn net.Conn) {
+	timeOut := (config.Heartbeat.Interval * time.Millisecond) * time.Duration(config.Heartbeat.Max)
+
+	conn.SetWriteDeadline(time.Now().Add(timeOut))
+	_, err := conn.Write(serializedCoordinatorDataMessage)
+	if err != nil {
+		log.Println("CoordinatorData send failed")
+		dataAckChan <- message.CoordinatorDataAck{
+			Ack: proto.Bool(false),
+		}
+		return
+	}
+
+	readBuf := make([]byte, BufSize)
+	conn.SetReadDeadline(time.Now().Add(timeOut))
+	_, err = conn.Read(readBuf)
+	if err != nil {
+		log.Println("CoordinatorDataAck receive failed", err)
+		dataAckChan <- message.CoordinatorDataAck{
+			Ack: proto.Bool(false),
+		}
+		return
+	}
+	coordinatorDataAckMessage := &message.CoordinatorDataAck{}
+	proto.Unmarshal(readBuf, coordinatorDataAckMessage)
+	dataAckChan <- *coordinatorDataAckMessage
 }
 
 func handleCoordinatorData(conn net.Conn) {
+	for {
+		readBuf := make([]byte, BufSize)
+		_, err := conn.Read(readBuf)
+		if err != nil {
+			if err == io.EOF {
+				return
+			}
+			log.Printf("Client data reading error", err)
+			continue
+		}
+
+		coordinatorDataMessage := &message.CoordinatorData{}
+		proto.Unmarshal(readBuf, coordinatorDataMessage)
+
+		coordinatorDataAckMessage := &message.CoordinatorDataAck{}
+
+		_, err = localWrite(coordinatorDataMessage.Data)
+		if err != nil {
+			coordinatorDataAckMessage.Ack = proto.Bool(false)
+		} else {
+			coordinatorDataAckMessage.Ack = proto.Bool(true)
+		}
+
+		serializedCoordinatorDataAckMessage, err := proto.Marshal(coordinatorDataAckMessage)
+		if err != nil {
+			log.Println("Marshaling error: ", err)
+			return
+		}
+		conn.Write(serializedCoordinatorDataAckMessage)
+	}
+}
+
+func localWrite(coordinatorData []byte) (int, error) {
+	storedData = append(storedData, coordinatorData)
+	return len(coordinatorData), nil
 }
