@@ -17,5 +17,5 @@
 package message;
 
 message ReplyLeader {
-	required string leader = 1;
+  required string leader = 1;
 }
